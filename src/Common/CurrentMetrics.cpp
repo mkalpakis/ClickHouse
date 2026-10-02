@@ -175,6 +175,9 @@
     M(ParallelFormattingOutputFormatThreads, "Number of threads in the ParallelFormattingOutputFormatThreads thread pool.") \
     M(ParallelFormattingOutputFormatThreadsActive, "Number of threads in the ParallelFormattingOutputFormatThreads thread pool running a task.") \
     M(ParallelFormattingOutputFormatThreadsScheduled, "Number of queued or active jobs in the ParallelFormattingOutputFormatThreads thread pool.") \
+    M(ArrowIPCBlockOutputFormatThreads, "Number of threads in the ArrowIPCBlockOutputFormat thread pool.") \
+    M(ArrowIPCBlockOutputFormatThreadsActive, "Number of threads in the ArrowIPCBlockOutputFormat thread pool running a task.") \
+    M(ArrowIPCBlockOutputFormatThreadsScheduled, "Number of queued or active jobs in the ArrowIPCBlockOutputFormat thread pool.") \
     M(MergeTreeBackgroundExecutorThreads, "Number of threads in the MergeTreeBackgroundExecutor thread pool.") \
     M(MergeTreeBackgroundExecutorThreadsActive, "Number of threads in the MergeTreeBackgroundExecutor thread pool running a task.") \
     M(MergeTreeBackgroundExecutorThreadsScheduled, "Number of queued or active jobs in the MergeTreeBackgroundExecutor thread pool.") \

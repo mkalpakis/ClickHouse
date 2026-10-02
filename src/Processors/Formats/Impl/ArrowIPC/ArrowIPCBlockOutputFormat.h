@@ -13,9 +13,12 @@
 #include <Columns/IColumn.h>
 #include <Common/StringHashForHeterogeneousLookup.h>
 #include <Common/StringWithMemoryTracking.h>
+#include <Common/ThreadPool.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/VectorWithMemoryTracking.h>
 
+#include <deque>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,7 +47,13 @@ private:
     void resetFormatterImpl() override;
 
     /// Encodes one chunk as exactly one record batch, preceded by the dictionary batches it references.
+    /// Dispatches to the thread pool when one exists, otherwise encodes and writes inline.
     void writeChunk(Chunk chunk);
+    /// Encodes `chunk` on the calling thread and writes the resulting batch message immediately.
+    void encodeAndWriteChunkInline(Chunk chunk);
+    /// Blocks until the oldest in-flight encode finishes, then writes its batch message. Used to keep
+    /// `in_flight` bounded by `parallel_pool`'s thread count, and to drain it at the end of the stream.
+    void writeOldestInFlightChunk();
 
     void writeSchemaIfNeeded();
     /// Writes one encapsulated message for an encoded batch (a record batch, or a dictionary batch
@@ -97,6 +106,14 @@ private:
     };
     ArrowIPC::DictPlans column_dict_plans;
     VectorWithMemoryTracking<DictionaryColumnState> dictionary_states;
+
+    /// Encodes chunks on `format_settings.max_threads` worker threads when the result has no
+    /// dictionary-encoded columns (see the constructor); null otherwise, or when max_threads <= 1,
+    /// in which case every chunk is encoded inline on the calling thread.
+    std::unique_ptr<ThreadPool> parallel_pool;
+    /// In encode-submission order, so results are written out in the order their chunks arrived
+    /// regardless of which worker thread finishes first.
+    std::deque<std::future<ArrowIPC::RecordBatchEncoder::EncodedBatch>> in_flight;
 
     /// Rows of consecutive chunks that are individually smaller than the configured record batch target,
     /// to be written as one record batch. The first chunk becomes the accumulator itself, so a staged batch

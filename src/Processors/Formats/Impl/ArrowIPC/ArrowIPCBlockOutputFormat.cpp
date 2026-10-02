@@ -26,12 +26,20 @@
 
 #include <utility>
 
+namespace CurrentMetrics
+{
+    extern const Metric ArrowIPCBlockOutputFormatThreads;
+    extern const Metric ArrowIPCBlockOutputFormatThreadsActive;
+    extern const Metric ArrowIPCBlockOutputFormatThreadsScheduled;
+}
+
 namespace DB
 {
 
 namespace ErrorCodes
 {
     extern const int VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace
@@ -147,7 +155,20 @@ ArrowIPCBlockOutputFormat::ArrowIPCBlockOutputFormat(
     size_t num_dictionaries = 0;
     for (const auto & plan : column_dict_plans)
         num_dictionaries = std::max(num_dictionaries, countDictionaries(plan));
+    if (num_dictionaries > 0)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Parallel {} output does not support LowCardinality columns encoded as Arrow dictionaries; "
+            "disable output_format_arrow_low_cardinality_as_dictionary",
+            stream ? "ArrowStream" : "Arrow");
     dictionary_states.resize(num_dictionaries);
+
+    if (format_settings.max_threads > 1)
+        parallel_pool = std::make_unique<ThreadPool>(
+            CurrentMetrics::ArrowIPCBlockOutputFormatThreads,
+            CurrentMetrics::ArrowIPCBlockOutputFormatThreadsActive,
+            CurrentMetrics::ArrowIPCBlockOutputFormatThreadsScheduled,
+            format_settings.max_threads);
 }
 
 void ArrowIPCBlockOutputFormat::writeSchemaIfNeeded()
@@ -396,6 +417,34 @@ void ArrowIPCBlockOutputFormat::consume(Chunk chunk)
 
 void ArrowIPCBlockOutputFormat::writeChunk(Chunk chunk)
 {
+    if (!parallel_pool)
+    {
+        encodeAndWriteChunkInline(std::move(chunk));
+        return;
+    }
+
+    /// Bound how many encoded batches can sit in memory waiting to be written: once there's one
+    /// in flight per worker thread, wait for (and write out) the oldest before submitting another.
+    while (in_flight.size() >= format_settings.max_threads)
+        writeOldestInFlightChunk();
+
+    /// No dictionary-encoded columns reach here (the constructor rejects them), so each chunk's
+    /// columns can be encoded independently, on its own `RecordBatchEncoder`, off the calling thread.
+    const size_t num_rows = chunk.getNumRows();
+    /// `scheduleOrThrowOnError` takes a `std::function`, which requires a copyable target, but
+    /// `std::packaged_task` is move-only — a `shared_ptr` makes the job itself copyable.
+    auto task = std::make_shared<std::packaged_task<ArrowIPC::RecordBatchEncoder::EncodedBatch()>>(
+        [columns = chunk.detachColumns(), &types = column_types, &settings = format_settings, num_rows]() mutable
+        {
+            ArrowIPC::RecordBatchEncoder local_encoder(settings);
+            return local_encoder.encode(columns, types, num_rows);
+        });
+    in_flight.push_back(task->get_future());
+    parallel_pool->scheduleOrThrowOnError([task]() { (*task)(); });
+}
+
+void ArrowIPCBlockOutputFormat::encodeAndWriteChunkInline(Chunk chunk)
+{
     const size_t num_rows = chunk.getNumRows();
     const Columns & columns = chunk.getColumns();
 
@@ -417,11 +466,24 @@ void ArrowIPCBlockOutputFormat::writeChunk(Chunk chunk)
         record_blocks.push_back({written.offset, written.metadata_length, written.body_length});
 }
 
+void ArrowIPCBlockOutputFormat::writeOldestInFlightChunk()
+{
+    auto batch = in_flight.front().get();
+    in_flight.pop_front();
+    auto written = writeBatchMessage(batch);
+    if (!stream)
+        record_blocks.push_back({written.offset, written.metadata_length, written.body_length});
+}
+
 void ArrowIPCBlockOutputFormat::finalizeImpl()
 {
     /// The whole output of a result that never reached a target leaves through here.
     if (staged.getNumRows())
         writeChunk(std::move(staged));
+
+    /// Drain every encode still in flight, in submission order, before EOS/footer.
+    while (!in_flight.empty())
+        writeOldestInFlightChunk();
 
     /// Make sure even an empty result produces a valid stream/file (schema, then EOS or footer).
     writeSchemaIfNeeded();
@@ -446,6 +508,7 @@ void ArrowIPCBlockOutputFormat::resetFormatterImpl()
 {
     /// `finalizeImpl` drains it on every normal path; this also covers a reset after an interrupted one.
     staged.clear();
+    in_flight.clear();
     message_writer.emplace(out);
     schema_written = false;
     dictionary_blocks.clear();
